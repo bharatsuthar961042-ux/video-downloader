@@ -51,49 +51,59 @@ jobs:
           FORMAT_CHOICE: ${{ inputs.format }}
         run: |
           mkdir -p downloads diagnostics
-          python - <<'PY'
-          import os
-          from urllib.parse import urlparse
-          u = urlparse(os.environ["VIDEO_URL"].strip())
-          path = u.path.lower()
-          direct = path.endswith((".mp4", ".m4v", ".webm", ".mov", ".mkv"))
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write("direct_file=" + ("true" if direct else "false") + "\n")
-          print("Input type: direct video file" if direct else "Input type: webpage/extractor URL")
-          PY
+          URL_PATH="${VIDEO_URL%%\?*}"
+          URL_PATH="${URL_PATH,,}"
           set +e
-          if [ "$(python -c 'import os; print("true" if os.environ["VIDEO_URL"].lower().split("?")[0].endswith((".mp4",".m4v",".webm",".mov",".mkv")) else "false)')" = "true" ]; then
-            curl --fail --location --show-error --silent \
-              --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 1800 \
-              --output downloads/video-file "$VIDEO_URL" \
-              2>diagnostics/curl-error.log
-            RESULT=$?
-            if [ "$RESULT" -eq 0 ] && [ -s downloads/video-file ]; then
-              MIME="$(file --brief --mime-type downloads/video-file)"
-              case "$MIME" in
-                video/*|application/octet-stream) mv downloads/video-file "downloads/video-file.${MIME#video/}" ;;
-                *) echo "Server response is not recognized as a video file (MIME: $MIME)." > diagnostics/curl-error.log; RESULT=22 ;;
-              esac
-            fi
-            METHOD="direct HTTP file download"
-          else
-            if [ "$FORMAT_CHOICE" = "MP4 when available" ]; then
-              FORMAT="bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
-              MERGE="mp4"
-            else
-              FORMAT="bv*+ba/b"
-              MERGE="mkv"
-            fi
-            yt-dlp --no-playlist --format "$FORMAT" --merge-output-format "$MERGE" \
-              --output "downloads/%(title).160B.%(ext)s" -- "$VIDEO_URL" \
-              > diagnostics/yt-dlp-private.log 2>&1
-            RESULT=$?
-            METHOD="yt-dlp webpage extraction"
-          fi
+          case "$URL_PATH" in
+            *.mp4|*.m4v|*.webm|*.mov|*.mkv)
+              echo "Input type: direct video file"
+              curl --fail --location --show-error --silent \
+                --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 1800 \
+                --output downloads/video-file "$VIDEO_URL" \
+                2>diagnostics/curl-error.log
+              RESULT=$?
+              METHOD="direct HTTP file download"
+              if [ "$RESULT" -eq 0 ] && [ -s downloads/video-file ]; then
+                MIME="$(file --brief --mime-type downloads/video-file)"
+                case "$MIME" in
+                  video/mp4) EXT="mp4" ;;
+                  video/webm) EXT="webm" ;;
+                  video/quicktime) EXT="mov" ;;
+                  video/x-matroska) EXT="mkv" ;;
+                  application/octet-stream)
+                    EXT="${URL_PATH##*.}"
+                    ;;
+                  *)
+                    echo "Server response is not recognized as a video file (MIME: $MIME)." > diagnostics/curl-error.log
+                    RESULT=22
+                    EXT="bin"
+                    ;;
+                esac
+                if [ "$RESULT" -eq 0 ]; then
+                  mv downloads/video-file "downloads/video-file.$EXT"
+                fi
+              fi
+              ;;
+            *)
+              echo "Input type: webpage/extractor URL"
+              if [ "$FORMAT_CHOICE" = "MP4 when available" ]; then
+                FORMAT="bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+                MERGE="mp4"
+              else
+                FORMAT="bv*+ba/b"
+                MERGE="mkv"
+              fi
+              yt-dlp --no-playlist --format "$FORMAT" --merge-output-format "$MERGE" \
+                --output "downloads/%(title).160B.%(ext)s" -- "$VIDEO_URL" \
+                > diagnostics/yt-dlp-private.log 2>&1
+              RESULT=$?
+              METHOD="yt-dlp webpage extraction"
+              ;;
+          esac
           set -e
 
           python - "$RESULT" "$METHOD" <<'PY'
-          import os, sys
+          import sys
           from pathlib import Path
           code, method = int(sys.argv[1]), sys.argv[2]
           logs = []
@@ -138,7 +148,7 @@ jobs:
               "The workflow does not bypass anti-bot controls, authentication, paywalls, or DRM. "
               "Diagnostic artifacts intentionally exclude raw logs, signed URLs, cookies, and credentials.\n"
           )
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+          with open(__import__("os").environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"exit_code={code}\n")
               f.write(f"category={category}\n")
           print(f"Diagnostic: {category}")
