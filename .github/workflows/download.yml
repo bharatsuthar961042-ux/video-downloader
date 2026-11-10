@@ -40,16 +40,17 @@ jobs:
       - name: Install yt-dlp and FFmpeg
         run: |
           python -m pip install --upgrade pip
-          python -m pip install yt-dlp
+          python -m pip install --upgrade yt-dlp
           sudo apt-get update
           sudo apt-get install -y ffmpeg zip
 
       - name: Download authorized, non-DRM media
+        id: download
         env:
           VIDEO_URL: ${{ inputs.video_url }}
           FORMAT_CHOICE: ${{ inputs.format }}
         run: |
-          mkdir -p downloads
+          mkdir -p downloads diagnostics
           if [ "$FORMAT_CHOICE" = "MP4 when available" ]; then
             FORMAT="bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
             MERGE="mp4"
@@ -57,18 +58,70 @@ jobs:
             FORMAT="bv*+ba/b"
             MERGE="mkv"
           fi
+
+          set +e
           yt-dlp --no-playlist --format "$FORMAT" --merge-output-format "$MERGE" \
-            --output "downloads/%(title).160B.%(ext)s" -- "$VIDEO_URL"
+            --output "downloads/%(title).160B.%(ext)s" -- "$VIDEO_URL" \
+            > diagnostics/yt-dlp-private.log 2>&1
+          RESULT=$?
+          set -e
+
+          python - "$RESULT" <<'PY'
+          import os, sys
+          from pathlib import Path
+
+          code = int(sys.argv[1])
+          log = Path("diagnostics/yt-dlp-private.log").read_text(errors="replace").lower()
+          if code == 0:
+              category = "Download completed"
+              explanation = "yt-dlp completed successfully."
+          elif "http error 403" in log or "cloudflare" in log or "captcha" in log:
+              category = "Access blocked (HTTP 403 / anti-bot)"
+              explanation = "The source server or its anti-bot service denied the GitHub-hosted runner. This workflow does not attempt to evade that restriction."
+          elif "drm" in log or "widevine" in log or "license" in log:
+              category = "Possible DRM-protected stream"
+              explanation = "The source appears to require protected playback. This workflow cannot decrypt DRM or extract keys."
+          elif "unsupported url" in log or "no suitable extractor" in log:
+              category = "Unsupported website"
+              explanation = "yt-dlp does not have a compatible extractor for this URL."
+          elif "no video formats found" in log or "requested format is not available" in log:
+              category = "No downloadable format found"
+              explanation = "The page did not expose a compatible downloadable format to yt-dlp."
+          elif "geo" in log or "country" in log and "restrict" in log:
+              category = "Possible regional restriction"
+              explanation = "The source may restrict playback by region."
+          elif "login" in log or "authentication" in log or "sign in" in log:
+              category = "Authentication required"
+              explanation = "The source requires an account or sign-in. Do not paste passwords, cookies, or session tokens into this workflow."
+          else:
+              category = "Download failed"
+              explanation = "The source returned an error not recognized by this diagnostic. Check the source's official help or use an authorized copy."
+          
+          Path("diagnostics/REPORT.md").write_text(
+              "# Download diagnostic report\n\n"
+              f"- **Result:** {category}\n"
+              f"- **yt-dlp exit code:** {code}\n\n"
+              f"{explanation}\n\n"
+              "## Privacy and access note\n"
+              "This report intentionally omits raw downloader logs, signed media URLs, cookies, headers, and credentials. "
+              "The workflow does not bypass anti-bot controls, paywalls, authentication, or DRM.\n"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"exit_code={code}\n")
+              f.write(f"category={category}\n")
+          print(f"Diagnostic: {category}")
+          print(explanation)
+          PY
 
       - name: Create ZIP
-        if: success()
+        if: steps.download.outputs.exit_code == '0'
         run: |
           test -n "$(find downloads -maxdepth 1 -type f -print -quit)"
           cd downloads
           zip -9 -r ../video-download.zip .
 
-      - name: Upload downloadable ZIP
-        if: success()
+      - name: Upload downloadable video
+        if: steps.download.outputs.exit_code == '0'
         uses: actions/upload-artifact@v4
         with:
           name: video-download
@@ -76,7 +129,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Explain failure
-        if: failure()
+      - name: Upload diagnostic report
+        if: always() && steps.download.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-diagnostics
+          path: diagnostics/REPORT.md
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Mark run failed when download failed
+        if: steps.download.outputs.exit_code != '0'
         run: |
-          echo "::error::This URL may be unsupported, unavailable, or DRM-protected. This workflow does not bypass DRM or access controls."
+          echo "::error::${{ steps.download.outputs.category || 'The download step did not complete.' }}"
+          exit 1
