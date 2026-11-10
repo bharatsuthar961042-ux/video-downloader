@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "URL for a video you own or are authorized to download"
+        description: "Direct MP4/WebM URL, or a supported page for authorized media"
         required: true
         type: string
       format:
-        description: "Output format"
+        description: "Output format (for page extraction)"
         required: true
         type: choice
         options:
@@ -37,79 +37,112 @@ jobs:
               raise SystemExit("URLs with embedded credentials are not accepted.")
           PY
 
-      - name: Install yt-dlp and FFmpeg
+      - name: Install tools
         run: |
           python -m pip install --upgrade pip
           python -m pip install --upgrade yt-dlp
           sudo apt-get update
           sudo apt-get install -y ffmpeg zip
 
-      - name: Download authorized, non-DRM media
+      - name: Download authorized media
         id: download
         env:
           VIDEO_URL: ${{ inputs.video_url }}
           FORMAT_CHOICE: ${{ inputs.format }}
         run: |
           mkdir -p downloads diagnostics
-          if [ "$FORMAT_CHOICE" = "MP4 when available" ]; then
-            FORMAT="bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
-            MERGE="mp4"
-          else
-            FORMAT="bv*+ba/b"
-            MERGE="mkv"
-          fi
-
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          u = urlparse(os.environ["VIDEO_URL"].strip())
+          path = u.path.lower()
+          direct = path.endswith((".mp4", ".m4v", ".webm", ".mov", ".mkv"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("direct_file=" + ("true" if direct else "false") + "\n")
+          print("Input type: direct video file" if direct else "Input type: webpage/extractor URL")
+          PY
           set +e
-          yt-dlp --no-playlist --format "$FORMAT" --merge-output-format "$MERGE" \
-            --output "downloads/%(title).160B.%(ext)s" -- "$VIDEO_URL" \
-            > diagnostics/yt-dlp-private.log 2>&1
-          RESULT=$?
+          if [ "$(python -c 'import os; print("true" if os.environ["VIDEO_URL"].lower().split("?")[0].endswith((".mp4",".m4v",".webm",".mov",".mkv")) else "false)')" = "true" ]; then
+            curl --fail --location --show-error --silent \
+              --retry 2 --retry-delay 2 --connect-timeout 20 --max-time 1800 \
+              --output downloads/video-file "$VIDEO_URL" \
+              2>diagnostics/curl-error.log
+            RESULT=$?
+            if [ "$RESULT" -eq 0 ] && [ -s downloads/video-file ]; then
+              MIME="$(file --brief --mime-type downloads/video-file)"
+              case "$MIME" in
+                video/*|application/octet-stream) mv downloads/video-file "downloads/video-file.${MIME#video/}" ;;
+                *) echo "Server response is not recognized as a video file (MIME: $MIME)." > diagnostics/curl-error.log; RESULT=22 ;;
+              esac
+            fi
+            METHOD="direct HTTP file download"
+          else
+            if [ "$FORMAT_CHOICE" = "MP4 when available" ]; then
+              FORMAT="bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+              MERGE="mp4"
+            else
+              FORMAT="bv*+ba/b"
+              MERGE="mkv"
+            fi
+            yt-dlp --no-playlist --format "$FORMAT" --merge-output-format "$MERGE" \
+              --output "downloads/%(title).160B.%(ext)s" -- "$VIDEO_URL" \
+              > diagnostics/yt-dlp-private.log 2>&1
+            RESULT=$?
+            METHOD="yt-dlp webpage extraction"
+          fi
           set -e
 
-          python - "$RESULT" <<'PY'
+          python - "$RESULT" "$METHOD" <<'PY'
           import os, sys
           from pathlib import Path
-
-          code = int(sys.argv[1])
-          log = Path("diagnostics/yt-dlp-private.log").read_text(errors="replace").lower()
-          if code == 0:
+          code, method = int(sys.argv[1]), sys.argv[2]
+          logs = []
+          for name in ("curl-error.log", "yt-dlp-private.log"):
+              p = Path("diagnostics") / name
+              if p.exists():
+                  logs.append(p.read_text(errors="replace").lower())
+          log = "\n".join(logs)
+          if code == 0 and any(Path("downloads").iterdir()):
               category = "Download completed"
-              explanation = "yt-dlp completed successfully."
-          elif "http error 403" in log or "cloudflare" in log or "captcha" in log:
-              category = "Access blocked (HTTP 403 / anti-bot)"
-              explanation = "The source server or its anti-bot service denied the GitHub-hosted runner. This workflow does not attempt to evade that restriction."
+              explanation = "The authorized video file was saved."
+          elif "http error 403" in log or "403 forbidden" in log:
+              category = "HTTP 403: source denied this request"
+              explanation = "The host denied the request from the GitHub runner. This is not automatically proof of Cloudflare; check the host's access policy or use its official export."
+          elif "cloudflare" in log or "captcha" in log:
+              category = "Anti-bot challenge detected"
+              explanation = "The source presented an anti-bot challenge. The workflow does not attempt to evade it."
+          elif "404" in log or "not found" in log:
+              category = "File or page not found"
+              explanation = "The supplied URL may be expired, incorrect, or no longer available."
           elif "drm" in log or "widevine" in log or "license" in log:
               category = "Possible DRM-protected stream"
-              explanation = "The source appears to require protected playback. This workflow cannot decrypt DRM or extract keys."
+              explanation = "Protected playback cannot be decrypted by this workflow."
           elif "unsupported url" in log or "no suitable extractor" in log:
               category = "Unsupported website"
-              explanation = "yt-dlp does not have a compatible extractor for this URL."
-          elif "no video formats found" in log or "requested format is not available" in log:
-              category = "No downloadable format found"
-              explanation = "The page did not expose a compatible downloadable format to yt-dlp."
-          elif "geo" in log or "country" in log and "restrict" in log:
-              category = "Possible regional restriction"
-              explanation = "The source may restrict playback by region."
-          elif "login" in log or "authentication" in log or "sign in" in log:
-              category = "Authentication required"
-              explanation = "The source requires an account or sign-in. Do not paste passwords, cookies, or session tokens into this workflow."
+              explanation = "yt-dlp has no compatible extractor for this page."
+          elif "timed out" in log or "timeout" in log:
+              category = "Network timeout"
+              explanation = "The server did not respond within the allowed time."
+          elif "ssl" in log or "certificate" in log:
+              category = "TLS/certificate error"
+              explanation = "The connection could not be verified securely."
           else:
-              category = "Download failed"
-              explanation = "The source returned an error not recognized by this diagnostic. Check the source's official help or use an authorized copy."
-          
+              category = "Download failed (unclassified)"
+              explanation = "Review the job step output for the reported HTTP, TLS, or network error."
           Path("diagnostics/REPORT.md").write_text(
               "# Download diagnostic report\n\n"
               f"- **Result:** {category}\n"
-              f"- **yt-dlp exit code:** {code}\n\n"
+              f"- **Method:** {method}\n"
+              f"- **Exit code:** {code}\n\n"
               f"{explanation}\n\n"
-              "## Privacy and access note\n"
-              "This report intentionally omits raw downloader logs, signed media URLs, cookies, headers, and credentials. "
-              "The workflow does not bypass anti-bot controls, paywalls, authentication, or DRM.\n"
+              "The workflow does not bypass anti-bot controls, authentication, paywalls, or DRM. "
+              "Diagnostic artifacts intentionally exclude raw logs, signed URLs, cookies, and credentials.\n"
           )
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"exit_code={code}\n")
               f.write(f"category={category}\n")
           print(f"Diagnostic: {category}")
+          print(f"Method: {method}")
           print(explanation)
           PY
 
