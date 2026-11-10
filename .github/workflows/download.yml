@@ -1,0 +1,82 @@
+name: Download authorized video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "URL for a video you own or are authorized to download"
+        required: true
+        type: string
+      format:
+        description: "Output format"
+        required: true
+        type: choice
+        options:
+          - "MP4 when available"
+          - "Best available original format"
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate URL
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          python - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          u = urlparse(os.environ["VIDEO_URL"].strip())
+          if u.scheme not in ("http", "https") or not u.hostname:
+              raise SystemExit("Enter a valid http(s) URL.")
+          if u.username or u.password:
+              raise SystemExit("URLs with embedded credentials are not accepted.")
+          PY
+
+      - name: Install yt-dlp and FFmpeg
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zip
+
+      - name: Download authorized, non-DRM media
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          FORMAT_CHOICE: ${{ inputs.format }}
+        run: |
+          mkdir -p downloads
+          if [ "$FORMAT_CHOICE" = "MP4 when available" ]; then
+            FORMAT="bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+            MERGE="mp4"
+          else
+            FORMAT="bv*+ba/b"
+            MERGE="mkv"
+          fi
+          yt-dlp --no-playlist --format "$FORMAT" --merge-output-format "$MERGE" \
+            --output "downloads/%(title).160B.%(ext)s" -- "$VIDEO_URL"
+
+      - name: Create ZIP
+        if: success()
+        run: |
+          test -n "$(find downloads -maxdepth 1 -type f -print -quit)"
+          cd downloads
+          zip -9 -r ../video-download.zip .
+
+      - name: Upload downloadable ZIP
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-download
+          path: video-download.zip
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Explain failure
+        if: failure()
+        run: |
+          echo "::error::This URL may be unsupported, unavailable, or DRM-protected. This workflow does not bypass DRM or access controls."
